@@ -1,0 +1,1055 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pelican Riding Bicycle</title>
+<style>html,body{margin:0;padding:0;overflow:hidden;width:100%;height:100%;background:#000}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "./lib/three.module.js",
+  "three/addons/": "./lib/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+let T = 0;
+let seeking = false;
+const motion = { on: true };
+const SPEED = 2.6;                 // ground speed (u/s) — wheel surface speed
+const P = 20*Math.PI;              // world wrap period (multiple of 2π => seamless loop)
+const HORIZON = new THREE.Color(0xf2a061);   // warm sunset horizon (matches sky shader)
+
+const wrapP = z => ((z + P/2) % P + P) % P - P/2;
+const sstep = (x,a,b) => THREE.MathUtils.smoothstep(x,a,b);
+
+// ============================== renderer ==============================
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(HORIZON.getHex(), 35, 190);   // general fog -> blends into sky
+
+const camera = new THREE.PerspectiveCamera(42, innerWidth/innerHeight, 0.1, 700);
+
+// orbit camera: drag=orbit, wheel=zoom, dblclick=reset, auto-orbit when idle
+const camState = { theta: 0.58, phi: 1.08, r: 4.8,
+  target: new THREE.Vector3(0, 1.35, 0), dragging: false };
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+{
+  const el = renderer.domElement;
+  let px = 0, py = 0;
+  el.style.cursor = 'grab';
+  el.addEventListener('pointerdown', e => {
+    camState.dragging = true; px = e.clientX; py = e.clientY;
+    el.style.cursor = 'grabbing'; el.setPointerCapture(e.pointerId);
+  });
+  el.addEventListener('pointermove', e => {
+    if(!camState.dragging) return;
+    camState.theta -= (e.clientX - px) * 0.006;
+    camState.phi   = clamp(camState.phi - (e.clientY - py) * 0.006, 0.25, 1.5);
+    px = e.clientX; py = e.clientY;
+  });
+  const end = () => { camState.dragging = false; el.style.cursor = 'grab'; };
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
+  el.addEventListener('wheel', e => {
+    e.preventDefault();
+    camState.r = clamp(camState.r + e.deltaY * 0.004, 2.4, 40);
+  }, {passive:false});
+  el.addEventListener('dblclick', () => { camState.theta = 0.58; camState.phi = 1.08; camState.r = 4.8; });
+}
+function placeCamera(){
+  const {theta, phi, r, target} = camState;
+  camera.position.set(
+    target.x + r*Math.sin(phi)*Math.sin(theta),
+    target.y + r*Math.cos(phi),
+    target.z + r*Math.sin(phi)*Math.cos(theta));
+  camera.lookAt(target);
+}
+
+// ============================== lights (sunset) ==============================
+const SUN_DIR = new THREE.Vector3(-0.42, 0.13, -0.89).normalize(); // low, near horizon
+const sun = new THREE.DirectionalLight(0xffb066, 4.2);
+sun.position.copy(SUN_DIR).multiplyScalar(15);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048,2048);
+Object.assign(sun.shadow.camera, {left:-13,right:13,top:13,bottom:-13,far:60});
+sun.shadow.bias = -0.0004;
+scene.add(sun, sun.target);
+const fill = new THREE.DirectionalLight(0xaab6e0, 0.85);   // cool dusk fill from front
+fill.position.set(-4, 5, 8);
+scene.add(fill);
+const hemi = new THREE.HemisphereLight(0xffd0a3, 0x8a7a50, 1.1);
+scene.add(hemi);
+
+// ============================== stylized sky + sun ==============================
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  uniforms: {
+    sunDir:   { value: SUN_DIR.clone() },
+    uTop:     { value: new THREE.Color(0x746baa) },
+    uMid:     { value: new THREE.Color(0xc4a0c4) },
+    uHor:     { value: new THREE.Color(0xfbd1a4) },   // == scene fog color
+    uBelow:   { value: new THREE.Color(0xc49897) },
+    uBand:    { value: new THREE.Color(0xffc495) },
+    uSunTint: { value: new THREE.Color(0xffe0b3) },
+  },
+  vertexShader: `
+    varying vec3 vW;
+    void main(){
+      vW = (modelMatrix * vec4(position,1.0)).xyz;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+    }`,
+  fragmentShader: `
+    varying vec3 vW;
+    uniform vec3 sunDir;
+    uniform vec3 uTop, uMid, uHor, uBelow, uBand, uSunTint;
+    void main(){
+      vec3 d = normalize(vW - cameraPosition);
+      float h = clamp(d.y, -0.15, 1.0);
+      vec3 col = mix(uHor, uMid, smoothstep(0.0, 0.22, h));
+      col = mix(col, uTop, smoothstep(0.18, 0.70, h));
+      col = mix(col, uBelow, smoothstep(0.02, -0.15, h));
+      col += uBand * pow(1.0 - abs(h), 8.0) * 0.55;  // sunset horizon band
+      float s = max(dot(d, sunDir), 0.0);
+      col += uSunTint * ( pow(s, 900.0) * 3.4   // disc (bloom picks it up)
+                        + pow(s, 90.0)  * 0.65  // inner glow
+                        + pow(s, 14.0)  * 0.28  // outer glow
+                        + pow(s, 3.0)   * 0.10 );  // wide wash
+      gl_FragColor = vec4(col, 1.0);
+    }`
+});
+const skydome = new THREE.Mesh(new THREE.SphereGeometry(320, 48, 24), skyMat);
+scene.add(skydome);
+
+// god-ray sun sprite (additive streaks)
+function godRayTexture(){
+  const c = document.createElement('canvas'); c.width = c.height = 512;
+  const ctx = c.getContext('2d');
+  ctx.translate(256, 256);
+  // core glow
+  let g = ctx.createRadialGradient(0,0,0, 0,0,90);
+  g.addColorStop(0, 'rgba(255,235,190,1)');
+  g.addColorStop(0.35, 'rgba(255,190,110,0.6)');
+  g.addColorStop(1, 'rgba(255,160,80,0)');
+  ctx.fillStyle = g; ctx.fillRect(-256,-256,512,512);
+  // streaks
+  for(let i=0;i<22;i++){
+    const a = (i/22)*Math.PI*2 + Math.random()*0.25;
+    const w = 3 + Math.random()*10;
+    const al = 0.04 + Math.random()*0.09;
+    ctx.save();
+    ctx.rotate(a);
+    const lg = ctx.createLinearGradient(0,0,256,0);
+    lg.addColorStop(0, `rgba(255,190,110,${al})`);
+    lg.addColorStop(1, 'rgba(255,170,90,0)');
+    ctx.fillStyle = lg;
+    ctx.beginPath();
+    ctx.moveTo(10, 0); ctx.lineTo(256, -w); ctx.lineTo(256, w); ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: godRayTexture(), blending: THREE.AdditiveBlending,
+  depthWrite: false, transparent: true, opacity: 0.75, fog: false }));
+sunSprite.position.copy(SUN_DIR).multiplyScalar(280);
+sunSprite.scale.setScalar(70);
+scene.add(sunSprite);
+
+// ============================== ground / road ==============================
+const groundMat = new THREE.MeshStandardMaterial({color:0x71a848, roughness:1});
+const ground = new THREE.Mesh(new THREE.CircleGeometry(320, 64), groundMat);
+// moving cloud shade on the terrain too: grass and ground darken together, and the
+// fade multiplies with shadow darkness exactly like it does on the grass
+const groundCloud = { uTimeG: {value: 0} };
+groundMat.onBeforeCompile = sh => {
+  Object.assign(sh.uniforms, groundCloud);
+  sh.vertexShader = sh.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec2 gCloudP;')
+    .replace('#include <project_vertex>', `#include <project_vertex>
+      gCloudP = (modelMatrix * vec4( transformed, 1.0 )).xz;`);
+  sh.fragmentShader = sh.fragmentShader
+    .replace('#include <common>',
+      '#include <common>\nuniform float uTimeG;\nvarying vec2 gCloudP;\n'
+      + 'float gcHash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }\n'
+      + 'float gcNoise(vec2 p){\n'
+      + '  p -= 256.0*floor(p/256.0);\n'
+      + '  vec2 i = floor(p); vec2 f = fract(p); f = f*f*(3.0-2.0*f);\n'
+      + '  return mix(mix(gcHash(i), gcHash(i+vec2(1.0,0.0)), f.x),\n'
+      + '             mix(gcHash(i+vec2(0.0,1.0)), gcHash(i+vec2(1.0,1.0)), f.x), f.y);\n'
+      + '}')
+    .replace('#include <color_fragment>', `#include <color_fragment>
+      vec2 gcp = gCloudP - vec2(uTimeG*2.2, uTimeG*0.9);
+      float gc = gcNoise(gcp*0.05)*0.6 + gcNoise(gcp*0.12 + 41.7)*0.4;
+      diffuseColor.rgb *= 0.55 + 0.45*smoothstep(0.25, 0.75, gc);`);
+};
+ground.rotation.x = -Math.PI/2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const roadMat = new THREE.MeshStandardMaterial({color:0x58585e, roughness:0.95});
+const road = new THREE.Mesh(new THREE.PlaneGeometry(3.6, 400), roadMat);
+road.rotation.x = -Math.PI/2; road.position.y = 0.002;
+road.receiveShadow = true;
+scene.add(road);
+const edgeMat = new THREE.MeshStandardMaterial({color:0xe8e8e0, roughness:0.9});
+for(const x of [-1.72, 1.72]){
+  const e = new THREE.Mesh(new THREE.PlaneGeometry(0.07,400), edgeMat);
+  e.rotation.x=-Math.PI/2; e.position.set(x,0.003,0); scene.add(e);
+}
+const dashMat = new THREE.MeshStandardMaterial({color:0xf2e86a, roughness:0.9});
+// z-fight guard: depth granularity grows ~dist^2, so a fixed 0.002 y-offset loses
+// to the ground plane beyond ~50u. Lift road markings by a small DISTANCE-PROPORTIONAL
+// amount in the vertex shader (local +z == world +y for these -90deg-rotated planes):
+// negligible up close, always > one depth step in the distance.
+function depthLift(mat){
+  mat.onBeforeCompile = sh => {
+    sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\n'
+      + 'vec4 zlW = modelMatrix * vec4(transformed, 1.0);\n'
+      + 'transformed.z += 0.0003 * length(cameraPosition - zlW.xyz);');
+  };
+}
+depthLift(roadMat); depthLift(edgeMat); depthLift(dashMat);
+const dashes = [];
+for(let i=-33;i<=33;i++){
+  const d = new THREE.Mesh(new THREE.PlaneGeometry(0.75,0.13), dashMat);
+  d.rotation.x=-Math.PI/2; d.position.set(0,0.004,i*Math.PI); scene.add(d);
+  dashes.push(d);
+}
+
+// distant hills (two rings, fog blends them into the sky)
+const hillMat = new THREE.MeshStandardMaterial({color:0x5f9448, roughness:1});
+function addHill(x, z, r, y){
+  const h = new THREE.Mesh(new THREE.SphereGeometry(r, 32, 16), hillMat);
+  h.scale.y = 0.34;
+  h.position.set(x, y, z);
+  scene.add(h);
+}
+for(let i=0;i<10;i++){
+  const a = i/10*Math.PI*2 + 0.3;
+  addHill(Math.cos(a)*150, Math.sin(a)*150, 70+Math.random()*40, -22);
+}
+for(let i=0;i<7;i++){
+  const a = i/7*Math.PI*2 + 0.9;
+  addHill(Math.cos(a)*75, Math.sin(a)*75, 34+Math.random()*18, -13);
+}
+
+// ============================== materials ==============================
+const M = {
+  white:  new THREE.MeshStandardMaterial({color:0xfaf8f0, roughness:0.6}),
+  cream:  new THREE.MeshStandardMaterial({color:0xf5eeda, roughness:0.65}),
+  orange: new THREE.MeshStandardMaterial({color:0xff9020, roughness:0.5}),
+  orangeD:new THREE.MeshStandardMaterial({color:0xe5740e, roughness:0.5}),
+  red:    new THREE.MeshStandardMaterial({color:0xd92b2b, roughness:0.3, metalness:0.3}),
+  steel:  new THREE.MeshStandardMaterial({color:0xb8c0c8, roughness:0.2, metalness:0.95}),
+  dark:   new THREE.MeshStandardMaterial({color:0x2b2b30, roughness:0.55}),
+  black:  new THREE.MeshStandardMaterial({color:0x171717, roughness:0.85}),
+  brown:  new THREE.MeshStandardMaterial({color:0x5a3a1e, roughness:0.9}),
+  leaf:   new THREE.MeshStandardMaterial({color:0x468c33, roughness:0.95}),
+  leafD:  new THREE.MeshStandardMaterial({color:0x35722a, roughness:0.95}),
+  leafL:  new THREE.MeshStandardMaterial({color:0x5aa040, roughness:0.95}),
+};
+
+// ============================== bicycle ==============================
+const bike = new THREE.Group();
+const R = 0.5, WB = 0.72;
+const AX  = new THREE.Vector3(0, R, -WB);
+const AXF = new THREE.Vector3(0, R,  WB);
+const BB  = new THREE.Vector3(0, 0.40, 0.02);
+const SEAT_TOP = new THREE.Vector3(-0.02, 1.02, -0.22);
+const HEAD_TOP = new THREE.Vector3(0.03, 1.0, 0.40);
+const HEAD_BOT = new THREE.Vector3(0.10, 0.74, 0.47);
+const V = (x,y,z)=>new THREE.Vector3(x,y,z);
+
+function tube(p1, p2, r, mat){
+  const a = p1.clone(), b = p2.clone();
+  const dir = b.clone().sub(a); const len = dir.length();
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 14), mat);
+  m.position.copy(a).add(b).multiplyScalar(0.5);
+  m.quaternion.setFromUnitVectors(V(0,1,0), dir.normalize());
+  m.castShadow = true;
+  return m;
+}
+function makeWheel(){
+  const w = new THREE.Group();
+  const tire = new THREE.Mesh(new THREE.TorusGeometry(R, 0.05, 16, 48), M.black);
+  const rim  = new THREE.Mesh(new THREE.TorusGeometry(R-0.045, 0.016, 10, 48), M.steel);
+  const hub  = new THREE.Mesh(new THREE.CylinderGeometry(0.045,0.045,0.07,16), M.steel);
+  hub.rotation.z = Math.PI/2;
+  w.add(tire, rim, hub);
+  const spGeo = new THREE.CylinderGeometry(0.006,0.006, 2*(R-0.05), 5);
+  for(let i=0;i<14;i++){
+    const s = new THREE.Mesh(spGeo, M.steel);
+    s.rotation.z = i*Math.PI/7;
+    w.add(s);
+  }
+  w.traverse(o=>o.castShadow=true);
+  return w;
+}
+// wheel plane = YZ (axle left-right, along x)
+const wheelFH = new THREE.Group(); wheelFH.position.copy(AXF); wheelFH.rotation.y = Math.PI/2;
+const wheelBH = new THREE.Group(); wheelBH.position.copy(AX);  wheelBH.rotation.y = Math.PI/2;
+const wheelF = makeWheel(); wheelFH.add(wheelF);
+const wheelB = makeWheel(); wheelBH.add(wheelB);
+bike.add(wheelFH, wheelBH);
+
+bike.add(
+  tube(BB, SEAT_TOP, 0.032, M.red),
+  tube(SEAT_TOP, HEAD_TOP, 0.03, M.red),
+  tube(BB, HEAD_BOT, 0.038, M.red),
+  tube(BB, AX, 0.024, M.red),
+  tube(SEAT_TOP, AX, 0.022, M.red),
+  tube(HEAD_BOT, AXF, 0.024, M.steel),
+  tube(HEAD_BOT, HEAD_TOP, 0.032, M.red),
+);
+bike.add(tube(SEAT_TOP, V(-0.03,1.06,-0.24), 0.016, M.steel));
+const saddle = new THREE.Mesh(new THREE.BoxGeometry(0.15,0.05,0.36), M.dark);
+saddle.position.set(-0.03, 1.08, -0.25);
+saddle.castShadow = true; bike.add(saddle);
+bike.add(tube(HEAD_TOP, V(0,1.05,0.44), 0.02, M.steel));
+const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.02,0.02,0.46,12), M.steel);
+bar.rotation.z = Math.PI/2; bar.position.set(0,1.05,0.44);
+bar.castShadow = true; bike.add(bar);
+for(const gx of [-0.22, 0.22]){
+  const grip = new THREE.Mesh(new THREE.CylinderGeometry(0.028,0.028,0.09,10), M.black);
+  grip.rotation.z = Math.PI/2; grip.position.set(gx,1.05,0.44);
+  grip.castShadow = true; bike.add(grip);
+}
+// crank spins about the x (left-right) axis; pedals rotate with it
+const CRANK = 0.17;
+const crank = new THREE.Group();
+crank.position.copy(BB);
+crank.add(
+  tube(V(), V(0.015,CRANK,0), 0.02, M.steel),
+  tube(V(), V(-0.015,-CRANK,0), 0.02, M.steel));
+// pedals: parented to bike (NOT the crank) so they orbit the crank
+// but keep their own orientation flat / parallel to the ground
+const pedGeo = new THREE.BoxGeometry(0.11,0.04,0.18);
+const ped1 = new THREE.Mesh(pedGeo, M.black); ped1.castShadow=true; bike.add(ped1);
+const ped2 = new THREE.Mesh(pedGeo, M.black); ped2.castShadow=true; bike.add(ped2);
+bike.add(crank);
+const ring = new THREE.Mesh(new THREE.CylinderGeometry(0.15,0.15,0.018,28), M.dark);
+ring.rotation.z = Math.PI/2; ring.position.copy(BB).add(V(0.005,0,0));
+bike.add(ring);
+const chain = new THREE.Mesh(new THREE.BoxGeometry(0.015,0.02,BB.distanceTo(AX)-0.22), M.black);
+chain.position.set(0, 0.44, (BB.z+AX.z)/2);
+bike.add(chain);
+
+const ride = new THREE.Group();
+ride.add(bike);
+scene.add(ride);
+
+// ============================== pelican ==============================
+const peli = new THREE.Group();
+const body = new THREE.Mesh(new THREE.SphereGeometry(0.4, 32, 24), M.white);
+body.scale.set(0.88, 0.82, 1.3);
+body.position.set(0, 1.36, -0.06);
+peli.add(body);
+const tail = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.42, 12), M.white);
+tail.rotation.x = -Math.PI/2 - 0.35;
+tail.position.set(0, 1.42, -0.62);
+peli.add(tail);
+const neckCurve = new THREE.CatmullRomCurve3([
+  V(0, 1.62, 0.18), V(0, 1.85, 0.32), V(0, 2.08, 0.30), V(0, 2.28, 0.26),
+]);
+const neck = new THREE.Mesh(new THREE.TubeGeometry(neckCurve, 16, 0.1, 14), M.white);
+peli.add(neck);
+const head = new THREE.Mesh(new THREE.SphereGeometry(0.16, 24, 18), M.white);
+head.scale.set(1, 0.95, 1.15);
+head.position.set(0, 2.34, 0.26);
+peli.add(head);
+const tuft = new THREE.Mesh(new THREE.SphereGeometry(0.045,10,8), M.cream);
+tuft.position.set(0, 2.48, 0.22);
+peli.add(tuft);
+const beakLen = 0.62;
+const beak = new THREE.Mesh(new THREE.ConeGeometry(0.07, beakLen, 14), M.orange);
+beak.rotation.x = Math.PI/2 + 0.05;
+beak.position.set(0, 2.34, 0.26 + beakLen/2 + 0.09);
+peli.add(beak);
+// lower beak: lathe profile starting inside the beak base, bulging, then
+// tapering to the same tip -> reads as one smooth beak
+const pouchPts = [];
+for(const [yy, rr] of [[0,0.055],[0.05,0.095],[0.15,0.118],[0.28,0.112],[0.42,0.085],
+                       [0.52,0.052],[0.59,0.022],[0.62,0.002]])
+  pouchPts.push(new THREE.Vector2(rr, yy));
+const pouch = new THREE.Mesh(new THREE.LatheGeometry(pouchPts, 20), M.orangeD);
+pouch.rotation.x = Math.PI/2 + 0.05;   // same axis as the beak cone
+pouch.position.set(0, 2.31, 0.26 + 0.09); // base flush with beak base
+peli.add(pouch);
+for(const sx of [-1,1]){
+  const eye = new THREE.Mesh(new THREE.SphereGeometry(0.033, 12, 10), M.black);
+  eye.position.set(sx*0.125, 2.39, 0.35);
+  peli.add(eye);
+  const w = new THREE.Mesh(new THREE.SphereGeometry(0.012,8,8),
+    new THREE.MeshStandardMaterial({color:0xffffff, roughness:0.3}));
+  w.position.set(sx*0.14, 2.405, 0.365);
+  peli.add(w);
+}
+const wingGeo = new THREE.SphereGeometry(0.3, 20, 14);
+const wingL = new THREE.Mesh(wingGeo, M.cream);
+wingL.scale.set(0.13, 0.72, 1.05);
+wingL.position.set(-0.30, 1.43, -0.13);
+wingL.rotation.set(0, 0.3, 0.18);
+peli.add(wingL);
+const wingR = wingL.clone();
+wingR.position.x = 0.30; wingR.rotation.set(0, -0.3, -0.18);
+peli.add(wingR);
+peli.traverse(o=>{ if(o.isMesh){o.castShadow=true; o.receiveShadow=true;} });
+ride.add(peli);
+
+// legs: 2-bone IK, no joint gaps (capsules overlap + joint spheres)
+function makeLegParts(colorA, colorB){
+  const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.068, 0.36, 6, 12), colorA);
+  const shin  = new THREE.Mesh(new THREE.CapsuleGeometry(0.048, 0.40, 6, 12), colorB);
+  const foot  = new THREE.Mesh(new THREE.BoxGeometry(0.12,0.05,0.24), colorA);
+  const hipJ  = new THREE.Mesh(new THREE.SphereGeometry(0.072, 12, 10), colorA);
+  const kneeJ = new THREE.Mesh(new THREE.SphereGeometry(0.055, 12, 10), colorB);
+  [thigh,shin,foot,hipJ,kneeJ].forEach(o=>o.castShadow=true);
+  peli.add(thigh, shin, foot, hipJ, kneeJ);
+  return {thigh, shin, foot, hipJ, kneeJ};
+}
+const legR = makeLegParts(M.orange, M.orangeD);
+const legL = makeLegParts(M.orangeD, M.orange);
+
+function solveLeg(leg, hip, footTarget, side){
+  const d = hip.distanceTo(footTarget);
+  const L1 = 0.48, L2 = 0.48;
+  const dist = Math.min(d, L1+L2-0.01);
+  const a = Math.acos((L1*L1 + dist*dist - L2*L2)/(2*L1*dist));
+  const mid = hip.clone().lerp(footTarget, 0.5);
+  const perp = V(side*0.35, -0.15, 0.9).normalize();
+  const knee = mid.clone().add(perp.clone().multiplyScalar(Math.sin(a)*L1));
+  const place = (mesh, p1, p2) => {
+    mesh.position.copy(p1).add(p2).multiplyScalar(0.5);
+    mesh.quaternion.setFromUnitVectors(V(0,1,0), p2.clone().sub(p1).normalize());
+  };
+  place(leg.thigh, hip, knee);
+  place(leg.shin, knee, footTarget);
+  leg.foot.position.copy(footTarget).add(V(side*0.01, 0.045, 0.04));
+  leg.hipJ.position.copy(hip);
+  leg.kneeJ.position.copy(knee);
+}
+
+// ============================== environment ==============================
+const scrollees = [];
+const scrollAdd = o => { o.userData.z0 = o.position.z; scrollees.push(o); scene.add(o); };
+
+function makeTree(x, z, s){
+  const g = new THREE.Group();
+  // tapered, slightly leaning trunk
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.055*s, 0.16*s, 1.9*s, 8), M.brown);
+  trunk.position.set((Math.random()-0.5)*0.05, 0.95*s, (Math.random()-0.5)*0.05);
+  trunk.rotation.z = (Math.random()-0.5)*0.1;
+  g.add(trunk);
+  // a few outward branches
+  for(let i=0;i<3;i++){
+    const a = Math.random()*Math.PI*2;
+    const br = new THREE.Mesh(new THREE.CylinderGeometry(0.02*s, 0.05*s, 0.55*s, 6), M.brown);
+    br.position.set(Math.cos(a)*0.18*s, (1.35+Math.random()*0.4)*s, Math.sin(a)*0.18*s);
+    br.quaternion.setFromUnitVectors(V(0,1,0),
+      V(Math.cos(a)*0.75, 0.65, Math.sin(a)*0.75).normalize());
+    g.add(br);
+  }
+  // irregular lumpy canopy: bright tops, darker undersides
+  const n = 8 + Math.floor(Math.random()*4);
+  for(let i=0;i<n;i++){
+    const a = Math.random()*Math.PI*2;
+    const rr = Math.random()*0.85*s;
+    const br = (0.45 + Math.random()*0.5) * s;
+    const c = new THREE.Mesh(new THREE.SphereGeometry(br, 14, 10),
+      [M.leafL, M.leaf, M.leaf, M.leafD][Math.floor(Math.random()*4)]);
+    c.position.set(Math.cos(a)*rr, (1.95 + Math.random()*0.95 - rr/(1.6*s)*0.4)*s, Math.sin(a)*rr);
+    c.scale.y = 0.78;
+    g.add(c);
+  }
+  g.traverse(o=>{o.castShadow=true; o.receiveShadow=true;});
+  g.position.set(x, 0, z);
+  return g;
+}
+// big tree pool along the road (wraps with the world scroll)
+const trees = [];   // {x, z0, s} for fog-occlusion + sway
+for(let i=0;i<64;i++){
+  const side = i%2 ? 1 : -1;
+  const x = side*(3.8 + Math.random()*26);
+  const z = (Math.random()-0.5)*P;
+  const s = 0.7 + Math.random()*1.1;
+  const g = makeTree(x, z, s);
+  scrollAdd(g);
+  trees.push({o: g, x, z0: z, s});
+}
+// bushes
+const bushes = [];  // {x, z0, r, y}
+for(let i=0;i<40;i++){
+  const side = i%2 ? 1 : -1;
+  const br2 = 0.3+Math.random()*0.45;
+  const b = new THREE.Mesh(new THREE.SphereGeometry(br2, 14, 10),
+    [M.leaf, M.leafD, M.leafL][i%3]);
+  b.scale.y = 0.62;
+  b.position.set(side*(2.6+Math.random()*10), 0, (Math.random()-0.5)*P);
+  b.position.y = b.scale.y*b.geometry.parameters.radius*0.9;
+  b.castShadow = b.receiveShadow = true;
+  scrollAdd(b);
+  bushes.push({o: b, x: b.position.x, z0: b.position.z, r: br2, y: b.position.y});
+}
+// rocks
+const rockMat = new THREE.MeshStandardMaterial({color:0x8d8d90, roughness:0.95});
+for(let i=0;i<24;i++){
+  const side = i%2 ? 1 : -1;
+  const r = new THREE.Mesh(new THREE.DodecahedronGeometry(0.15+Math.random()*0.35, 0), rockMat);
+  r.position.set(side*(2.4+Math.random()*8), 0.1, (Math.random()-0.5)*P);
+  r.rotation.set(Math.random()*3, Math.random()*3, Math.random()*3);
+  r.scale.y = 0.6;
+  r.castShadow = r.receiveShadow = true;
+  scrollAdd(r);
+}
+// flowers
+const flMat  = new THREE.MeshStandardMaterial({color:0xffd23e, roughness:0.7});
+const flMat2 = new THREE.MeshStandardMaterial({color:0xffffff, roughness:0.7});
+const flMat3 = new THREE.MeshStandardMaterial({color:0xff6b9d, roughness:0.7});
+const stMat  = new THREE.MeshStandardMaterial({color:0x2e6b2e, roughness:0.8});
+const swayFlowers = [];  // {o, ph} - bend hard in the wind
+for(let i=0;i<140;i++){
+  const x = (Math.random()-0.5)*50;
+  if(Math.abs(x) < 2.2) { i--; continue; }
+  const g = new THREE.Group();
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.015,0.015,0.28,5), stMat);
+  stem.position.y = 0.14;
+  const fl = new THREE.Mesh(new THREE.SphereGeometry(0.06,8,6),
+    [flMat, flMat2, flMat3][i%3]);
+  fl.position.y = 0.3;
+  g.add(stem, fl);
+  g.position.set(x, 0, (Math.random()-0.5)*P);
+  scrollAdd(g);
+  swayFlowers.push({o: g, ph: Math.random()*7});
+}
+
+// ============ DENSE grass (~100x): instanced blades, wind bent in shader.
+// density is thickest around the pelican's lane and falls off with distance;
+// a pool of extra blades streams WITH the world, scattered across the whole terrain
+// (like the base field), wrapping front->back in the vertex shader => infinite scrolling ground ==========
+const BLADE_W = 0.14, BLADE_H = 0.26;           // wide, tall, single triangle per blade
+const bladeGeo = new THREE.BufferGeometry();
+bladeGeo.setAttribute('position', new THREE.Float32BufferAttribute([
+  -BLADE_W/2, 0, 0,
+   BLADE_W/2, 0, 0,
+   0, BLADE_H, 0,
+], 3));
+bladeGeo.setIndex([0, 1, 2]);
+bladeGeo.computeVertexNormals();
+const grassMat = new THREE.MeshStandardMaterial({color:0xffffff, metalness:0, roughness:0.7, side:THREE.FrontSide});
+const grassUni = {
+  uTime: {value:0}, uZ: {value:0}, uWind: {value:1},
+  uFocus:{value:new THREE.Vector3(0,0,0)},    // rider focus (pelican at origin) - pool streams past this
+  uBase: {value:new THREE.Color(0x71a848)},   // exactly the terrain color
+  uTip:  {value:new THREE.Color(0x58a838)},
+};
+grassMat.onBeforeCompile = sh => {
+  Object.assign(sh.uniforms, grassUni);
+  sh.vertexShader = sh.vertexShader
+    .replace('#include <common>',
+      '#include <common>\nuniform float uTime; uniform float uZ; uniform float uWind;\nuniform vec3 uBase; uniform vec3 uTip; uniform vec3 uFocus;\nattribute vec4 aGrassData;\nvarying float vGh;\nvarying vec2 vGWorld;\n'
+      + 'float gHash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }\n'
+      + 'float gNoise(vec2 p){\n'
+      + '  p -= 256.0*floor(p/256.0);            // lattice wrap: stable hashing at any scroll distance\n'
+      + '  vec2 i = floor(p); vec2 f = fract(p); f = f*f*(3.0-2.0*f);\n'
+      + '  return mix(mix(gHash(i), gHash(i+vec2(1.0,0.0)), f.x),\n'
+      + '             mix(gHash(i+vec2(0.0,1.0)), gHash(i+vec2(1.0,1.0)), f.x), f.y);\n'
+      + '}')
+    .replace('#include <uv_vertex>', `#include <uv_vertex>
+      #ifdef USE_INSTANCING
+        // per-instance math hoisted here (runs before normals)
+        vec4 gIP = instanceMatrix * vec4(0.0,0.0,0.0,1.0);
+        vec3 gBasePos = gIP.xyz;
+        vec3 gPoolOffset = vec3(0.0);
+        float gPoolFade = 1.0;
+        // cheap GPU resample: pool blades stream WITH the world, scattered across
+        // the whole terrain like the base field, wrapping front -> back behind the fog
+        if (aGrassData.x > 0.5) {
+          float B   = 55.0;                              // half-width of the wrap band
+          float s   = mod(-uZ, 2.0*B);                   // bounded world scroll
+          float fLZ = uFocus.z - uZ;                     // mesh-local z of the focus
+          float hz  = aGrassData.z * (2.0*B) - B;        // home z in [-B, B)
+          float rz  = mod(hz - s + B, 2.0*B) - B;        // stream with world, wrap front->back
+          float px  = uFocus.x + aGrassData.y;           // full-terrain x (same scatter as base field)
+          gPoolFade = 1.0 - smoothstep(B - 8.0, B, abs(rz));  // fade to zero height at band edges
+          gPoolOffset = vec3(px, 0.0, fLZ + rz);
+        }
+        // single-sided blades mirror to ALWAYS present their face to the camera
+        // (see gFlip below): a back-facing blade can never vanish edge-on
+        vec3 gEffRootW = mix(gBasePos, gPoolOffset, step(0.5, aGrassData.x)) + vec3(0.0, 0.0, uZ);
+        // the blade's front face (local +z, rotated by the instance yaw) must point at
+        // the camera; if it faces away, mirror the blade so the winding stays front-side
+        vec3 gFwd = (instanceMatrix * vec4(0.0, 0.0, 1.0, 0.0)).xyz;
+        float gFace = dot(normalize(cameraPosition - gEffRootW), normalize(gFwd));
+        float gFlip = step(0.0, -gFace);
+      #endif`)
+    .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
+      #ifdef USE_INSTANCING
+        // winding flip => the triangle's true normal is inverted on flipped blades
+        if (gFlip > 0.5) objectNormal = -objectNormal;
+        // root normal -> straight up so the blade base lights EXACTLY like the ground beneath it
+        float gRoot = 1.0 - smoothstep(0.0, 0.30, position.y / 0.26);
+        objectNormal = normalize(mix(objectNormal, vec3(0.0, 1.0, 0.0), gRoot));
+      #endif`)
+    .replace('#include <begin_vertex>', `#include <begin_vertex>
+      vGh = position.y / 0.26;                    // blade height factor for the fragment blend
+      vec2 gWindDir = vec2(0.94, 0.34);           // wind direction (normalized)
+      float gLean = 0.0;                          // wind lean, applied in WORLD space (after instance yaw)
+      float gCamLean = 0.0;                       // subtle camera-facing lean so the field doesn't look flat
+      #ifdef USE_INSTANCING
+        // mirror across the blade axis: flips the winding so the rendered side faces the camera
+        if (gFlip > 0.5) transformed.x = -transformed.x;
+        if (aGrassData.x > 0.5) transformed.y *= gPoolFade;
+        float wz = (gBasePos + gPoolOffset).z + uZ;      // world z (grass mesh scrolls)
+        float gx = aGrassData.x > 0.5 ? gPoolOffset.x : gBasePos.x;   // effective root x
+        float gt = transformed.y / 0.26;                 // 0 at base, 1 at tip (post-fade)
+        float bend = gt*gt*uWind;
+        // --- Ghost of Tsushima-style wind ---
+        vec2 gP = vec2(gx, wz);
+        vGWorld = gP;                             // world xz for the fragment cloud shade
+        float gR = aGrassData.w;                          // per-blade random
+        // gust fronts: scrolling value noise, sampled against the wind => gust cells
+        // travel across the field IN the wind direction
+        float gust0 = gNoise(gP*0.08 - gWindDir*uTime*4.5)*0.6
+                    + gNoise(gP*0.30 + 37.2 - gWindDir*uTime*9.0)*0.4;    // 0..1 gust strength
+        float gust = gust0*gust0*(3.0-2.0*gust0);  // sharpen calm/gusty contrast so fronts read
+        gLean = (0.04 + 0.24*gust) * bend;        // 1) gentle gust lean, calm in between (world space)
+        gCamLean = 0.10 * bend;                    // 3) lean toward the camera (world space)
+        // 2) minimal turbulence: faint per-blade shimmer, tip-led, stronger in gusts
+        float sway = sin(uTime*(1.2 + gR*0.8) + gR*40.0 + gP.x*0.5)
+                   * (0.005 + 0.008*gust);
+        transformed.x += gt*gt*gt * sway;
+        transformed.z += gt*gt*gt * sway * 0.4;
+      #endif`)
+    .replace('#include <project_vertex>', `vec4 mvPosition = vec4( transformed, 1.0 );
+      #ifdef USE_INSTANCING
+        mvPosition = instanceMatrix * mvPosition;
+        if (aGrassData.x > 0.5) mvPosition.xyz += gPoolOffset - gBasePos;
+        // wind lean in WORLD space: every blade tilts along the wind, regardless of its yaw
+        mvPosition.x += gLean * instanceMatrix[1][1] * gWindDir.x;
+        mvPosition.z += gLean * instanceMatrix[1][1] * gWindDir.y;
+        // subtle camera-facing tilt so the blades catch the light and don't read as flat
+        vec2 toCam = cameraPosition.xz - vec2(mvPosition.x, mvPosition.z + uZ);
+        float tcl = length(toCam);
+        if(tcl > 0.001) {
+          toCam /= tcl;
+          mvPosition.x += gCamLean * instanceMatrix[1][1] * toCam.x;
+          mvPosition.z += gCamLean * instanceMatrix[1][1] * toCam.y;
+        }
+      #endif
+      mvPosition = modelViewMatrix * mvPosition;
+      gl_Position = projectionMatrix * mvPosition;`)
+    .replace('#include <color_vertex>', `#include <color_vertex>
+      #if defined( USE_COLOR ) || defined( USE_INSTANCING_COLOR )
+        // base color matches the terrain exactly, blending to grass green up top
+        vColor = mix(uBase, vColor*uTip, smoothstep(0.0, 0.70, position.y/0.26));
+      #endif`);
+  sh.fragmentShader = sh.fragmentShader
+    .replace('#include <common>',
+      '#include <common>\nuniform vec3 uBase; uniform float uTime;\nvarying float vGh; varying vec2 vGWorld;\n'
+      + 'float gHash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }\n'
+      + 'float gNoise(vec2 p){\n'
+      + '  p -= 256.0*floor(p/256.0);            // lattice wrap: stable hashing at any scroll distance\n'
+      + '  vec2 i = floor(p); vec2 f = fract(p); f = f*f*(3.0-2.0*f);\n'
+      + '  return mix(mix(gHash(i), gHash(i+vec2(1.0,0.0)), f.x),\n'
+      + '             mix(gHash(i+vec2(0.0,1.0)), gHash(i+vec2(1.0,1.0)), f.x), f.y);\n'
+      + '}')
+    .replace('#include <color_fragment>', `#include <color_fragment>
+      // blade root takes the terrain color on BOTH faces (front + back)
+      float gRootF = 1.0 - smoothstep(0.0, 0.70, vGh);
+      // moving cloud shadows: the GROUND gets the identical fade, so the terrain blend
+      // fades to the (cloud + shadow darkened) terrain - they always match
+      vec2 cp = vGWorld - vec2(uTime*2.2, uTime*0.9);
+      float cloud = gNoise(cp*0.05)*0.6 + gNoise(cp*0.12 + 41.7)*0.4;
+      diffuseColor.rgb = mix(diffuseColor.rgb, uBase, gRootF)
+                       * (0.55 + 0.45*smoothstep(0.25, 0.75, cloud));`)
+    .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+      // match the ground material (roughness 1) in the root zone so lighting is identical
+      roughnessFactor = mix(roughnessFactor, 1.0, gRootF);`)
+    .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+      // shade the blade root like the ground on both faces (backface normals are
+      // flipped -> pointing down -> N.L ~ 0 -> black root on the back side)
+      normal = normalize(mix(normal, normalize(mat3(viewMatrix) * vec3(0.0, 1.0, 0.0)), gRootF));
+      // one-triangle blades have a single flat normal -> hard sun glint that flickers
+      // as the camera moves. Rebuild a perturbed per-pixel normal (screen-space
+      // derivatives + dithered offset) so the specular scatters smoothly.
+      // Scaled by (1-gRootF) so the ground-blended root zone is NOT perturbed.
+      normal = normalize(normal
+        + (1.0 - gRootF) * (normalize(cross(dFdx(normal), dFdy(normal)) + vec3(0.0, 0.15, 0.0))
+        + vec3(fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5, 0.0, 0.0) * 0.3));`);
+};
+const GRASS_N = 600000;   // unique blades, x2 wrap copies = 1.2M instances
+const POOL = 380000, POOL0 = GRASS_N - POOL;     // pool blades: band density ~= base field density => 2x grass near rider
+const grass = new THREE.InstancedMesh(bladeGeo, grassMat, GRASS_N*2);
+const gObj = new THREE.Object3D();
+function scatterBlade(idx, x, lz){
+  gObj.rotation.set(0, Math.random()*Math.PI, 0);
+  const sc = 0.7 + Math.random()*0.8;
+  gObj.scale.set(sc, sc*(0.8+Math.random()*0.5), sc);
+  for(const dz of [0, -P]){                          // duplicate => seamless wrap
+    gObj.position.set(x, 0, lz + dz);
+    gObj.updateMatrix();
+    grass.setMatrixAt(idx + (dz===0?0:GRASS_N), gObj.matrix);
+  }
+}
+const poolX = new Float32Array(POOL);           // terrain x of each pool blade (reused in shader)
+{
+  const col = new THREE.Color();
+  for(let i=0;i<GRASS_N;i++){
+    // clumpy tufts; density falls off fast from the pelican's lane
+    const x = (Math.random()<0.5?-1:1) * (2.4 + Math.pow(Math.random(),2.2)*30)
+              + (Math.random()+Math.random()-1)*0.55;
+    const z = (Math.random()-0.5)*P + (Math.random()-0.5)*4;
+    if(i>=POOL0 && i<POOL0+POOL) poolX[i-POOL0] = x;
+    scatterBlade(i, x, z);
+    col.setRGB(1, 1, 1);                        // monochrome - all tint comes from uBase/uTip + cloud shade
+    grass.setColorAt(i, col);
+    grass.setColorAt(i + GRASS_N, col);
+  }
+  grass.instanceMatrix.needsUpdate = true;
+  if(grass.instanceColor) grass.instanceColor.needsUpdate = true;
+}
+// per-instance data for the cheap vertex-shader resample:
+// pool blades carry their terrain x (+1) and a uniform home-z in the wrap band (+2)
+const aGrassData = new THREE.InstancedBufferAttribute(new Float32Array(GRASS_N*2*4), 4);
+for(let i=0;i<GRASS_N*2;i++){
+  const o = i*4;
+  const isPool = (i>=POOL0 && i<POOL0+POOL);       // pool blades (primary copy only)
+  aGrassData.array[o]   = isPool ? 1 : 0;
+  aGrassData.array[o+1] = isPool ? poolX[i-POOL0] : Math.random();
+  aGrassData.array[o+2] = Math.random();           // home z (pool: uniform over the band)
+  aGrassData.array[o+3] = Math.random();
+}
+bladeGeo.setAttribute('aGrassData', aGrassData);
+grass.frustumCulled = false;   // blades are re-placed in the vertex shader; the mesh's own
+                              // bounding sphere (at z=-SPEED*t) would wrongly cull them by camera angle
+grass.receiveShadow = true;
+scene.add(grass);
+
+// ============ flapping birds circling the scene ============
+const birdMat = new THREE.MeshStandardMaterial({color:0x241f2e, roughness:0.9, side:THREE.DoubleSide});
+// triangular wing (root wide -> tip narrow), pointing +x
+function wingGeometry(){
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute([
+    0, 0, -0.075,   0, 0, 0.085,   0.34, 0, -0.030,   // leading->trailing, tip
+    0, 0, 0.085,    0.16, 0, 0.100,  0.34, 0, -0.030,   // trailing notch
+  ], 3));
+  g.computeVertexNormals();
+  return g;
+}
+const wingGeoR = wingGeometry();
+const wingGeoL = wingGeometry(); wingGeoL.scale(-1, 1, 1); wingGeoL.computeVertexNormals();
+function makeBird(){
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.04, 0.16, 4, 8), birdMat);
+  body.rotation.x = Math.PI/2;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6), birdMat);
+  head.position.z = 0.12;
+  const beak = new THREE.Mesh(new THREE.ConeGeometry(0.015, 0.06, 6), birdMat);
+  beak.rotation.x = Math.PI/2; beak.position.z = 0.17;
+  const wR = new THREE.Mesh(wingGeoR, birdMat); wR.position.set(0.02, 0.02, -0.02);
+  const wL = new THREE.Mesh(wingGeoL, birdMat); wL.position.set(-0.02, 0.02, -0.02);
+  const tail = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.12, 4), birdMat);
+  tail.rotation.x = -Math.PI/2 + 0.3; tail.position.z = -0.16;
+  g.add(body, head, beak, wL, wR, tail);
+  g.userData.wL = wL; g.userData.wR = wR;
+  g.scale.setScalar(1.6);   // distant birds: make them read clearly
+  return g;
+}
+const birds = [];
+for(let i=0;i<7;i++){
+  const b = makeBird();
+  b.userData.data = {
+    r: 5+Math.random()*10, h: 5+Math.random()*9,
+    sp: (0.22+Math.random()*0.3)*(i%2?1:-1), ph: Math.random()*Math.PI*2,
+    cx: (Math.random()-0.5)*10, cz: (Math.random()-0.5)*14,
+    bob: 0.5+Math.random(), flapSp: 11+Math.random()*5 };
+  scene.add(b); birds.push(b);
+}
+
+// volumetric-feel clouds: soft sprite puffs
+function cloudTexture(){
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const ctx = c.getContext('2d');
+  for(let i=0;i<16;i++){
+    const x = 128 + (Math.random()-0.5)*150;
+    const y = 135 + (Math.random()-0.5)*90;
+    const r = 30 + Math.random()*55;
+    const g = ctx.createRadialGradient(x,y,0,x,y,r);
+    g.addColorStop(0, 'rgba(255,255,255,0.85)');
+    g.addColorStop(0.6, 'rgba(255,255,255,0.4)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,256,256);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const cloudTex = cloudTexture();
+const clouds = [];
+for(let i=0;i<18;i++){
+  const m = new THREE.SpriteMaterial({map: cloudTex, transparent: true,
+    opacity: 0.5 + Math.random()*0.35, fog: false, depthWrite: false});
+  const sp = new THREE.Sprite(m);
+  const s = 14 + Math.random()*26;
+  sp.scale.set(s, s*0.55, 1);
+  sp.position.set((Math.random()-0.5)*200, 24 + Math.random()*26, -80 + Math.random()*140);
+  sp.userData = { bx: sp.position.x, phase: Math.random()*Math.PI*2 };
+  scene.add(sp);
+  clouds.push(sp);
+}
+
+// card fog: animated drifting-noise planes, alpha fades to 0 at the edges
+function fogCardMaterial(seed){
+  return new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, side: THREE.DoubleSide,
+    uniforms: {
+      uTime:    { value: 0 },
+      uSeed:    { value: seed },
+      uColor:   { value: new THREE.Color(0xf6d3ae) },   // warm sunset fog tint
+      uOpacity: { value: 0 },
+      uObs:     { value: [] },                           // vec4(x,y,z,r) obstacles
+      uObsN:    { value: 0 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      varying vec3 vW;
+      void main(){
+        vUv = uv;
+        vW = (modelMatrix * vec4(position, 1.0)).xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      varying vec2 vUv;
+      varying vec3 vW;
+      uniform float uTime, uSeed, uOpacity;
+      uniform vec3 uColor;
+      uniform vec4 uObs[24];
+      uniform int uObsN;
+      float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+      float vnoise(vec2 p){
+        vec2 i = floor(p), f = fract(p);
+        vec2 u = f*f*(3.0 - 2.0*f);
+        return mix(mix(hash(i), hash(i+vec2(1.0,0.0)), u.x),
+                   mix(hash(i+vec2(0.0,1.0)), hash(i+vec2(1.0,1.0)), u.x), u.y);
+      }
+      float fbm(vec2 p){
+        float v = 0.0, a = 0.5;
+        for(int k = 0; k < 5; k++){
+          v += a * vnoise(p);
+          p = p * 2.03 + vec2(17.13, 9.71);
+          a *= 0.5;
+        }
+        return v;
+      }
+      void main(){
+        vec2 p = vUv * 2.2 + uSeed;
+        float n1 = fbm(p + vec2(uTime, uTime*0.62));
+        float n2 = fbm(p*1.6 - vec2(uTime*0.7, uTime*0.45) + uSeed*0.5);
+        float m = (n1 + 0.55*n2) / 1.55;
+        float fogA = smoothstep(0.32, 0.82, m);
+        // fade alpha to 0 towards the edges of the square
+        float edge = smoothstep(0.0, 0.28, vUv.x) * smoothstep(0.0, 0.28, 1.0 - vUv.x)
+                   * smoothstep(0.0, 0.32, vUv.y) * smoothstep(0.0, 0.32, 1.0 - vUv.y);
+        float a = uOpacity * fogA * edge;
+        // fade to 0 where the card intersects/overlaps a solid object
+        // (tree trunks, canopies, bushes) in front of it
+        for(int i = 0; i < 24; i++){
+          if(i >= uObsN) break;
+          vec4 o = uObs[i];
+          float d = length(vW - o.xyz);
+          a *= smoothstep(o.w * 0.45, o.w + 0.5, d);
+        }
+        if(a < 0.004) discard;
+        gl_FragColor = vec4(uColor, a);
+      }`,
+  });
+}
+const fogCards = [];
+for(let i=0;i<16;i++){
+  const mat = fogCardMaterial(i*7.31);
+  const w = 4 + Math.random()*4, h = 2.6 + Math.random()*2.0;
+  const card = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  const side = i%2 ? 1 : -1;
+  card.position.set(side*(2.2 + Math.random()*3.4), 1.2 + Math.random()*1.4,
+                    (Math.random()-0.5)*P);
+  card.userData = { z0: card.position.z };
+  scrollees.push(card);
+  scene.add(card);
+  fogCards.push(card);
+}
+// per-card obstacle list: trees/bushes that the card overlaps (relative to the
+// card, which is constant since both scroll at the same rate)
+for(const card of fogCards){
+  const cx = card.position.x, cy = card.position.y, cz = card.position.z;
+  const obs = [];
+  const push = (ox, oy, oz, r) => {
+    const dz = wrapP(oz - cz);
+    if(Math.abs(ox-cx) > 9 || Math.abs(oy-cy) > 4 || Math.abs(dz) > 14) return;
+    if(obs.length < 24) obs.push(new THREE.Vector4(ox-cx, oy-cy, dz, r));
+  };
+  for(const tr of trees){
+    push(tr.x, 0.95*tr.s, tr.z0, 0.22*tr.s + 0.3);    // trunk
+    push(tr.x, 2.25*tr.s, tr.z0, 1.05*tr.s + 0.35);   // canopy
+  }
+  for(const bu of bushes) push(bu.x, bu.y, bu.z0, bu.r + 0.3); // bush
+  // three needs the vec4 array to always be full length -> pad with far-away
+  while(obs.length < 24) obs.push(new THREE.Vector4(0, 999, 0, 0));
+  card.material.uniforms.uObs.value = obs;
+  card.material.uniforms.uObsN.value = obs.length;
+}
+
+// ============================== post: bloom ==============================
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.42, 0.75, 0.72);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ============================== animation ==============================
+function update(t){
+  // all frequencies are integer multiples of 2.6 rad/s => one-crank-clip loops
+  wheelF.rotation.z = 5.2*t;
+  wheelB.rotation.z = 5.2*t;
+  crank.rotation.x = 2.6*t;
+
+  const ang = crank.rotation.x;
+  const pedR = V(0.02, CRANK, 0).applyAxisAngle(V(1,0,0), ang).add(BB);
+  const pedL = V(-0.02,-CRANK, 0).applyAxisAngle(V(1,0,0), ang).add(BB);
+  solveLeg(legR, V(0.1, 1.2, -0.24), pedR, 1);
+  solveLeg(legL, V(-0.1, 1.2, -0.24), pedL, -1);
+  // pedals ride the crank position but stay parallel to the ground
+  ped1.position.copy(pedR);
+  ped2.position.copy(pedL);
+  ped1.rotation.set(0,0,0);
+  ped2.rotation.set(0,0,0);
+
+  ride.position.y = Math.sin(t*5.2)*0.015;
+  ride.rotation.z = Math.sin(t*5.2)*0.012;
+
+  const flap = Math.sin(t*2.6)*0.08 + Math.sin(t*13.0+1.0)*0.03; // + wind flutter
+  wingL.rotation.x = flap;
+  wingR.rotation.x = flap;
+  const hb = Math.sin(t*5.2+0.5)*0.012;
+  head.position.y = 2.34 + hb;
+  beak.position.y = 2.34 + hb;
+  pouch.position.y = 2.31 + hb;
+  tuft.position.y = 2.48 + hb;
+
+  clouds.forEach(c => { c.position.x = c.userData.bx + Math.sin(t*2.6 + c.userData.phase)*4; });
+
+  // strong gusty wind: trees lean, bushes sway, flowers bend hard
+  for(const tr of trees){
+    const ph = tr.z0*0.35;
+    const w = Math.sin(t*1.9+ph)*0.55 + Math.sin(t*3.8+ph*0.7+1.3)*0.3 + Math.sin(t*0.67+0.5)*0.4;
+    tr.o.rotation.z = -w * (0.06 + 0.07*(tr.s-0.7)/1.1);
+  }
+  for(const bu of bushes){
+    const ph = bu.z0*0.5;
+    const w = Math.sin(t*1.9+ph)*0.55 + Math.sin(t*3.8+1.3+ph)*0.3 + Math.sin(t*0.67+0.5)*0.4;
+    bu.o.rotation.z = -w * 0.10;
+  }
+  for(const f of swayFlowers){
+    const ph = f.ph;
+    const w = Math.sin(t*1.9+ph)*0.55 + Math.sin(t*3.8+ph*1.3+1.3)*0.3 + Math.sin(t*0.67+0.5)*0.4;
+    f.o.rotation.z = -w * 0.5;
+  }
+
+  // grass: wind bend + cheap pool resample live in the shader; scroll the mesh with the world
+  // (pool wraps back-to-front around the rider in the shader - focus stays at the pelican)
+  grassUni.uTime.value = t;
+  grassUni.uZ.value = -SPEED*t;
+  grass.position.z = -SPEED*t;
+
+  // birds: circle + flap
+  for(const b of birds){
+    const d = b.userData.data;
+    const a  = d.ph + t*d.sp;
+    const na = d.ph + (t + 0.05)*d.sp;
+    const px = d.cx + Math.cos(a)*d.r,  pz = d.cz + Math.sin(a)*d.r;
+    const nx = d.cx + Math.cos(na)*d.r, nz = d.cz + Math.sin(na)*d.r;
+    b.position.set(px, d.h + Math.sin(a*d.bob)*0.9, pz);
+    b.lookAt(nx, d.h + Math.sin(na*d.bob)*0.9, nz);
+    const f = Math.sin(t*d.flapSp + d.ph*3)*0.9;
+    b.userData.wL.rotation.z = 0.25 + f;
+    b.userData.wR.rotation.z = -(0.25 + f);
+  }
+
+  if(motion.on){
+    const s = SPEED*t;
+    for(let i=0;i<dashes.length;i++)
+      dashes[i].position.z = i*Math.PI - (s % Math.PI);
+    for(const o of scrollees){
+      o.position.z = wrapP(o.userData.z0 - s);
+    }
+  }
+  // card fog: billboard to camera, fade in from far existence, fade out
+  // when too close; drift the noise (0.414 ~ 2.6/2pi keeps drift on loop rhythm)
+  for(const c of fogCards){
+    c.quaternion.copy(camera.quaternion);
+    const d = camera.position.distanceTo(c.position);
+    c.material.uniforms.uOpacity.value = 0.45 * sstep(70, 40, d) * sstep(8, 3.0, d);
+    c.material.uniforms.uTime.value = T * 0.414;
+  }
+}
+
+function render(){
+  update(T);
+  placeCamera();
+  composer.render();
+}
+render();
+
+window.__seek = (t) => { T = t; seeking = true; render(); };
+window.__birds = birds;  // debug handle
+window.__dbg = { get scene(){return scene}, get renderer(){return renderer}, get ground(){return ground}, get grass(){return grass}, get bladeGeo(){return bladeGeo}, get poolX(){return poolX}, get groundMat(){return groundMat}, get roadMat(){return roadMat} };
+window.__setMotion = (on) => { motion.on = !!on; };
+window.__cam = (theta, phi, r) => {
+  if(theta != null) camState.theta = theta;
+  if(phi != null) camState.phi = phi;
+  if(r != null) camState.r = r;
+  render();
+};
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+let last = performance.now();
+function loop(now){
+  const dt = Math.min((now-last)/1000, 0.1);
+  if(!seeking){
+    T += dt;
+    if(!camState.dragging) camState.theta += dt*0.05;
+    render();
+  }
+  last = now;
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+node_modules/
+dbg_*.png
+snap_*.png
+crop_*.png
+*.mjs
+image.png
+pelican-riding.gif
+nul
+package.json
+package-lock.json
+ToDo
+*.txt
